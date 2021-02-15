@@ -2,26 +2,28 @@
 
 import os
 import logging
-import torch
+from typing import Dict, List, Tuple, Union
+
 import numpy as np
+from scipy.stats import entropy
+from scipy.sparse import csr_matrix
+from sklearn.preprocessing import normalize
+from sklearn.metrics.pairwise import cosine_similarity
 try:
 	import networkx as nx
 	from networkx.algorithms.bipartite.matrix import from_biadjacency_matrix
 except ImportError:
 	nx = None
-from transformers import *
-from typing import Dict, List, Text, Tuple
-from scipy.stats import entropy
-from scipy.sparse import csr_matrix
-from sklearn.preprocessing import normalize
-from sklearn.metrics.pairwise import cosine_similarity
+import torch
+from transformers import BertModel, BertTokenizer, XLMModel, XLMTokenizer, RobertaModel, RobertaTokenizer, XLMRobertaModel, XLMRobertaTokenizer, AutoConfig, AutoModel, AutoTokenizer
+
 from simalign.utils import get_logger
 
 LOG = get_logger(__name__)
 
 
 class EmbeddingLoader(object):
-	def __init__(self, model="bert-base-multilingual-cased", device=torch.device('cpu'), layer=8):
+	def __init__(self, model: str="bert-base-multilingual-cased", device=torch.device('cpu'), layer: int=8):
 		TR_Models = {
 			'bert-base-uncased': (BertModel, BertTokenizer),
 			'bert-base-multilingual-cased': (BertModel, BertTokenizer),
@@ -57,37 +59,35 @@ class EmbeddingLoader(object):
 			else:
 				raise ValueError("The model '{}' is not recognised!".format(model))
 
-	def get_embed_list(self, sent_pair):
+	def get_embed_list(self, sent_batch: List[List[str]]) -> torch.Tensor:
 		if self.emb_model is not None:
-			sent_ids = [self.tokenizer.convert_tokens_to_ids(x) for x in sent_pair]
-			inputs = [self.tokenizer.prepare_for_model(sent, return_token_type_ids=True, return_tensors='pt')['input_ids'] for sent in sent_ids]
+			with torch.no_grad():
+				if not isinstance(sent_batch[0], str):
+					inputs = self.tokenizer(sent_batch, is_split_into_words=True, padding=True, truncation=True, return_tensors="pt")
+				else:
+					inputs = self.tokenizer(sent_batch, is_split_into_words=False, padding=True, truncation=True, return_tensors="pt")
+				outputs = self.emb_model(**inputs.to(self.device))[2][self.layer]
 
-			outputs = [self.emb_model(in_ids.to(self.device)) for in_ids in inputs]
-			# use vectors from layer 8
-			vectors = [x[2][self.layer].cpu().detach().numpy()[0][1:-1] for x in outputs]
-			return vectors
+				return outputs[:, 1:-1, :]
 		else:
 			return None
 
 
 class SentenceAligner(object):
 	def __init__(self, model: str = "bert", token_type: str = "bpe", distortion: float = 0.0, matching_methods: str = "mai", device: str = "cpu", layer: int = 8):
-		TR_Models = [
-			'bert-base-uncased', 'bert-base-multilingual-cased', 'bert-base-multilingual-uncased',
-			'xlm-mlm-100-1280', 'roberta-base', 'xlm-roberta-base', 'xlm-roberta-large']
+		model_names = {
+			"bert": "bert-base-multilingual-cased",
+			"xlmr": "xlm-roberta-base"
+			}
 		all_matching_methods = {"a": "inter", "m": "mwmf", "i": "itermax", "f": "fwd", "r": "rev"}
 
 		self.model = model
+		if model in model_names:
+			self.model = model_names[model]
 		self.token_type = token_type
 		self.distortion = distortion
 		self.matching_methods = [all_matching_methods[m] for m in matching_methods]
 		self.device = torch.device(device)
-
-		# add some shortcuts
-		if model == "bert":
-			self.model = "bert-base-multilingual-cased"
-		elif model == "xlmr":
-			self.model = "xlm-roberta-base"
 
 		self.embed_loader = EmbeddingLoader(model=self.model, device=self.device, layer=layer)
 
@@ -112,6 +112,32 @@ class SentenceAligner(object):
 	@staticmethod
 	def get_similarity(X: np.ndarray, Y: np.ndarray) -> np.ndarray:
 		return (cosine_similarity(X, Y) + 1.0) / 2.0
+
+	@staticmethod
+	def average_embeds_over_words(bpe_vectors: np.ndarray, word_tokens_pair: List[List[str]]) -> List[np.array]:
+		w2b_map = []
+		cnt = 0
+		w2b_map.append([])
+		for wlist in word_tokens_pair[0]:
+			w2b_map[0].append([])
+			for x in wlist:
+				w2b_map[0][-1].append(cnt)
+				cnt += 1
+		cnt = 0
+		w2b_map.append([])
+		for wlist in word_tokens_pair[1]:
+			w2b_map[1].append([])
+			for x in wlist:
+				w2b_map[1][-1].append(cnt)
+				cnt += 1
+
+		new_vectors = []
+		for l_id in range(2):
+			w_vector = []
+			for word_set in w2b_map[l_id]:
+				w_vector.append(bpe_vectors[l_id][word_set].mean(0))
+			new_vectors.append(np.array(w_vector))
+		return new_vectors
 
 	@staticmethod
 	def get_alignment_matrix(sim_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -165,7 +191,11 @@ class SentenceAligner(object):
 			count += 1
 		return inter
 
-	def get_word_aligns(self, src_sent: List, trg_sent: List) -> Dict[str, List]:
+	def get_word_aligns(self, src_sent: Union[str, List[str]], trg_sent: Union[str, List[str]]) -> Dict[str, List]:
+		if isinstance(src_sent, str):
+			src_sent = src_sent.split()
+		if isinstance(trg_sent, str):
+			trg_sent = trg_sent.split()
 		l1_tokens = [self.embed_loader.tokenizer.tokenize(word) for word in src_sent]
 		l2_tokens = [self.embed_loader.tokenizer.tokenize(word) for word in trg_sent]
 		bpe_lists = [[bpe for w in sent for bpe in w] for sent in [l1_tokens, l2_tokens]]
@@ -178,30 +208,11 @@ class SentenceAligner(object):
 			for i, wlist in enumerate(l2_tokens):
 				l2_b2w_map += [i for x in wlist]
 
-		vectors = self.embed_loader.get_embed_list(list(bpe_lists))
+		vectors = self.embed_loader.get_embed_list([src_sent, trg_sent]).cpu().detach().numpy()
+		vectors = [vectors[i, :len(bpe_lists[i])] for i in [0, 1]]
+
 		if self.token_type == "word":
-			w2b_map = []
-			cnt = 0
-			w2b_map.append([])
-			for wlist in l1_tokens:
-				w2b_map[0].append([])
-				for x in wlist:
-					w2b_map[0][-1].append(cnt)
-					cnt += 1
-			cnt = 0
-			w2b_map.append([])
-			for wlist in l2_tokens:
-				w2b_map[1].append([])
-				for x in wlist:
-					w2b_map[1][-1].append(cnt)
-					cnt += 1
-			new_vectors = []
-			for l_id in range(2):
-				w_vector = []
-				for word_set in w2b_map[l_id]:
-					w_vector.append(vectors[l_id][word_set].mean(0))
-				new_vectors.append(np.array(w_vector))
-			vectors = np.array(new_vectors)
+			vectors = self.average_embeds_over_words(vectors, [l1_tokens, l2_tokens])
 
 		all_mats = {}
 		sim = self.get_similarity(vectors[0], vectors[1])
@@ -209,8 +220,10 @@ class SentenceAligner(object):
 
 		all_mats["fwd"], all_mats["rev"] = self.get_alignment_matrix(sim)
 		all_mats["inter"] = all_mats["fwd"] * all_mats["rev"]
-		all_mats["mwmf"] = self.get_max_weight_match(sim)
-		all_mats["itermax"] = self.iter_max(sim)
+		if "mwmf" in self.matching_methods:
+			all_mats["mwmf"] = self.get_max_weight_match(sim)
+		if "itermax" in self.matching_methods:
+			all_mats["itermax"] = self.iter_max(sim)
 
 		aligns = {x: set() for x in self.matching_methods}
 		for i in range(len(vectors[0])):
