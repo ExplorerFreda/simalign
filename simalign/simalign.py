@@ -14,8 +14,10 @@ try:
 	from networkx.algorithms.bipartite.matrix import from_biadjacency_matrix
 except ImportError:
 	nx = None
+from transformers import BertModel, BertTokenizer, XLMModel, XLMTokenizer, \
+	RobertaModel, RobertaTokenizer, XLMRobertaModel, XLMRobertaTokenizer, \
+	AutoConfig, AutoModel, AutoTokenizer
 import torch
-from transformers import BertModel, BertTokenizer, XLMModel, XLMTokenizer, RobertaModel, RobertaTokenizer, XLMRobertaModel, XLMRobertaTokenizer, AutoConfig, AutoModel, AutoTokenizer
 
 from simalign.utils import get_logger
 
